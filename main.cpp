@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -179,22 +180,87 @@ bool sendAll(int fd, const char* d, int n) {
     return true;
 }
 
-// replace the value of the Host header so the host can tell which service is meant
-std::string fixHost(const std::string& req, const std::string& host) {
-    std::string out;
-    size_t pos = 0;
-    while (pos < req.size()) {
-        size_t eol = req.find("\r\n", pos);
-        if (eol == std::string::npos) eol = req.size();
-        std::string line = req.substr(pos, eol - pos);
-        std::string low;
-        for (char c : line) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (low.rfind("host:", 0) == 0) line = "Host: " + host;
-        else if (low.rfind("origin:", 0) == 0) line.clear();
-        if (!(low.rfind("origin:", 0) == 0)) { out += line; out += "\r\n"; }
-        pos = eol + 2;
+// ---------- small helpers: SHA-1 + base64 (for the WebSocket handshake) ----------
+struct Sha1 {
+    uint32_t h[5] = {0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u};
+    uint64_t total = 0;
+    unsigned char buf[64];
+    size_t used = 0;
+    static uint32_t rol(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
+    void block(const unsigned char* p) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++) w[i] = (uint32_t(p[i * 4]) << 24) | (uint32_t(p[i * 4 + 1]) << 16) | (uint32_t(p[i * 4 + 2]) << 8) | p[i * 4 + 3];
+        for (int i = 16; i < 80; i++) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999u; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1u; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCu; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6u; }
+            uint32_t t = rol(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rol(b, 30); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
     }
-    return out;
+    void update(const unsigned char* p, size_t n) {
+        total += n;
+        while (n > 0) {
+            size_t take = 64 - used < n ? 64 - used : n;
+            std::memcpy(buf + used, p, take);
+            used += take; p += take; n -= take;
+            if (used == 64) { block(buf); used = 0; }
+        }
+    }
+    void finish(unsigned char out[20]) {
+        uint64_t bits = total * 8;
+        unsigned char pad = 0x80;
+        update(&pad, 1);
+        unsigned char z = 0;
+        while (used != 56) update(&z, 1);
+        unsigned char len[8];
+        for (int i = 0; i < 8; i++) len[i] = static_cast<unsigned char>(bits >> (56 - 8 * i));
+        update(len, 8);
+        for (int i = 0; i < 5; i++) { out[i * 4] = h[i] >> 24; out[i * 4 + 1] = h[i] >> 16; out[i * 4 + 2] = h[i] >> 8; out[i * 4 + 3] = h[i]; }
+    }
+};
+
+std::string base64(const unsigned char* d, size_t n) {
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string o;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = uint32_t(d[i]) << 16;
+        if (i + 1 < n) v |= uint32_t(d[i + 1]) << 8;
+        if (i + 2 < n) v |= d[i + 2];
+        o += T[(v >> 18) & 63];
+        o += T[(v >> 12) & 63];
+        o += (i + 1 < n) ? T[(v >> 6) & 63] : '=';
+        o += (i + 2 < n) ? T[v & 63] : '=';
+    }
+    return o;
+}
+
+std::string acceptFor(const std::string& key) {
+    Sha1 s;
+    std::string in = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    s.update(reinterpret_cast<const unsigned char*>(in.data()), in.size());
+    unsigned char out[20];
+    s.finish(out);
+    return base64(out, 20);
+}
+
+std::string headerValue(const std::string& head, const char* name) {
+    std::string low;
+    for (char c : head) low += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::string needle = std::string("\r\n") + name + ":";
+    size_t p = low.find(needle);
+    if (p == std::string::npos) return "";
+    p += needle.size();
+    size_t e = head.find("\r\n", p);
+    std::string v = head.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    size_t a = v.find_first_not_of(" \t");
+    size_t b = v.find_last_not_of(" \t");
+    return a == std::string::npos ? "" : v.substr(a, b - a + 1);
 }
 
 struct Conn {
@@ -220,31 +286,61 @@ void* connThread(void* arg) {
     int fd = static_cast<int>(reinterpret_cast<intptr_t>(arg));
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    Remote* remote = openRemote();
-    if (!remote) { ::close(fd); detachThread(); return nullptr; }
-    LOG("game connected, tunnel open");
 
-    // first the HTTP upgrade request
+    // 1) read the game's upgrade request and answer it AT ONCE (the game gives up quickly)
     std::string head;
     char buf[16384];
-    bool ok = true;
     while (head.find("\r\n\r\n") == std::string::npos) {
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0 || head.size() > 65536) { ok = false; break; }
+        if (n <= 0 || head.size() > 65536) { ::close(fd); detachThread(); return nullptr; }
         head.append(buf, static_cast<size_t>(n));
     }
+    size_t end = head.find("\r\n\r\n") + 4;
+    std::string rest = head.substr(end);
+    head = "\r\n" + head.substr(0, end);
+    std::string key = headerValue(head, "sec-websocket-key");
+    if (key.empty()) { ::close(fd); detachThread(); return nullptr; }
+    std::string reply = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acceptFor(key) + "\r\n\r\n";
+    if (!sendAll(fd, reply.data(), static_cast<int>(reply.size()))) { ::close(fd); detachThread(); return nullptr; }
+    LOG("game connected, answered the handshake");
+
+    // 2) open our own connection to the bot online and do the handshake there
+    Remote* remote = openRemote();
+    bool ok = remote != nullptr;
+    std::string leftover;
+    if (ok) {
+        unsigned char rnd[16];
+        for (int i = 0; i < 16; i++) rnd[i] = static_cast<unsigned char>(std::rand() & 0xFF);
+        std::string req = std::string("GET / HTTP/1.1\r\nHost: ") + RELAY_HOST + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + base64(rnd, 16) + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        ok = remote->write(req.data(), static_cast<int>(req.size()));
+        std::string resp;
+        while (ok && resp.find("\r\n\r\n") == std::string::npos) {
+            int n = remote->read(buf, sizeof(buf));
+            if (n <= 0 || resp.size() > 65536) { ok = false; break; }
+            resp.append(buf, static_cast<size_t>(n));
+        }
+        if (ok) {
+            ok = resp.compare(0, 12, "HTTP/1.1 101") == 0;
+            if (!ok) LOG("online side refused: %.40s", resp.c_str());
+            else leftover = resp.substr(resp.find("\r\n\r\n") + 4);
+        }
+    }
+    if (!ok) {
+        LOG("could not reach the bot online");
+        if (remote) { remote->close(); delete remote; }
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+        detachThread();
+        return nullptr;
+    }
+    LOG("tunnel open");
     Conn conn{fd, remote};
     pthread_t down;
     bool started = false;
-    if (ok) {
-        size_t end = head.find("\r\n\r\n") + 4;
-        std::string request = fixHost(head.substr(0, end), RELAY_HOST) ;
-        std::string rest = head.substr(end);
-        ok = remote->write(request.data(), static_cast<int>(request.size()));
-        if (ok && !rest.empty()) ok = remote->write(rest.data(), static_cast<int>(rest.size()));
-        if (ok) started = pthread_create(&down, nullptr, downLoop, &conn) == 0;
-    }
-    while (ok && started) {   // game -> online
+    if (!leftover.empty()) ok = sendAll(fd, leftover.data(), static_cast<int>(leftover.size()));
+    if (ok && !rest.empty()) ok = remote->write(rest.data(), static_cast<int>(rest.size()));
+    if (ok) started = pthread_create(&down, nullptr, downLoop, &conn) == 0;
+    while (ok && started) {   // game -> online (frames are already masked by the game, as the bot expects)
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) break;
         if (!remote->write(buf, static_cast<int>(n))) break;
