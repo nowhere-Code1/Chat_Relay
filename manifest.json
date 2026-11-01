@@ -1,0 +1,9 @@
+{
+  "type": "preload-native",
+  "name": "ChatRelay",
+  "author": "ZaKaTiK009",
+  "version": "1.0.0",
+  "entry": "libchat_relay.so",
+  "icon": "icon.png",
+  "minecraft_versions": ["1.26.*", "1.26.5*"]
+}
